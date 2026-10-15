@@ -957,6 +957,48 @@ def _test_layernorm_linear(parallel_mode=None, sequence_parallel=False, **kwargs
         )
 
 
+@run_distributed_test()
+def _test_layernorm_linear_gathered_norm_output_grad():
+    """Test the input gradient through ``return_layernorm_output_gathered=True``.
+
+    The gathered norm output feeds a side branch with a column-parallel weight,
+    as a LoRA adapter does, so each rank holds a partial gradient for it.
+    """
+    # Create models
+    model_single_node = te.LayerNormLinear(HIDDEN_SIZE, HIDDEN_SIZE, return_layernorm_output=True)
+    model_distributed = te.LayerNormLinear(
+        HIDDEN_SIZE,
+        HIDDEN_SIZE,
+        tp_size=WORLD_SIZE,
+        tp_group=NCCL_WORLD,
+        parallel_mode="column",
+        sequence_parallel=True,
+        return_layernorm_output=True,
+        return_layernorm_output_gathered=True,
+    )
+    _copy_params(model_distributed, model_single_node)
+
+    # Side branch weight, split along output features like the linear layer
+    branch_weight = torch.randn((HIDDEN_SIZE, HIDDEN_SIZE)).cuda()
+    branch_weight_distributed = torch.chunk(branch_weight, WORLD_SIZE, dim=0)[WORLD_RANK]
+
+    # Apply models and side branch
+    input_distributed = torch.randn((SEQ_LEN, HIDDEN_SIZE)).cuda()
+    input_single_node = _gather(input_distributed).detach()
+    (output_single_node, norm_s), (output_distributed, norm_d) = _apply_models(
+        model_single_node, model_distributed, input_single_node, input_distributed
+    )
+    _check_outputs(norm_s, norm_d)
+    output_single_node = output_single_node + norm_s @ branch_weight.t()
+    output_distributed = output_distributed + norm_d @ branch_weight_distributed.t()
+    output_distributed = _gather(output_distributed, dim=1)
+
+    # Backpropagate and check input gradients
+    _loss_backward(output_single_node, output_distributed)
+    _check_outputs(output_single_node, output_distributed)
+    _check_input_grads(input_single_node, input_distributed, "column", True)
+
+
 def test_layernorm_linear():
     kwargs_list = [
         {},
@@ -976,6 +1018,8 @@ def test_layernorm_linear():
         for parallel_mode in ["column"]:
             for sequence_parallel in [False, True]:
                 _test_layernorm_linear(parallel_mode, sequence_parallel, **kwargs)
+
+    _test_layernorm_linear_gathered_norm_output_grad()
 
 
 ############################################

@@ -776,7 +776,12 @@ def _layernorm_linear_setup_ctx(
     bwd_args.zero_centered_gamma = fwd_args.zero_centered_gamma
     bwd_args.bwd_ln_sm_margin = fwd_args.bwd_ln_sm_margin
     bwd_args.return_layernorm_output = fwd_args.return_layernorm_output
-    bwd_args.return_layernorm_output_gathered = fwd_args.return_layernorm_output_gathered
+    # The returned norm output is gathered only with column-parallel sequence parallelism
+    bwd_args.return_layernorm_output_gathered = (
+        fwd_args.return_layernorm_output_gathered
+        and fwd_args.parallel_mode == "column"
+        and fwd_args.sequence_parallel
+    )
 
     # Numerical / dtype config
     bwd_args.activation_dtype = fwd_args.activation_dtype
@@ -1167,6 +1172,8 @@ def _layernorm_linear_backward_impl(
             nvtx_range_push(f"{nvtx_label}.column_parallel_comm_dgrad")
             dgrad = gemm_out
             if args.sequence_parallel:
+                if args.return_layernorm_output and args.return_layernorm_output_gathered:
+                    dgrad = dgrad + args.grad_ln_out
                 dgrad, dgrad_work = reduce_scatter_along_first_dim(
                     dgrad,
                     args.tp_group,
@@ -1394,6 +1401,13 @@ def _layernorm_linear_backward_impl(
         # Residual gradient
         if args.return_layernorm_output and not args.return_layernorm_output_gathered:
             dgrad = dgrad + args.grad_ln_out
+        elif args.return_layernorm_output_gathered and (
+            args.ub_overlap_rs_dgrad or args.ub_bulk_wgrad
+        ):
+            # Userbuffers and cuBLASMp fuse the dgrad reduce-scatter with a
+            # GEMM, so reduce-scatter the norm output grad separately
+            grad_ln_out, _ = reduce_scatter_along_first_dim(args.grad_ln_out, args.tp_group)
+            dgrad = dgrad + grad_ln_out
 
         # Norm gradient
         dgamma = None
